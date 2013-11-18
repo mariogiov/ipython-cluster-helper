@@ -159,17 +159,51 @@ class BcbioSGEControllerLauncher(launcher.SGEControllerLauncher):
     def start(self):
         return super(BcbioSGEControllerLauncher, self).start()
 
-def _find_parallel_environment():
-    """Find an SGE/OGE parallel environment for running multicore jobs.
+def _find_parallel_environment(queue):
+    """Find an SGE/OGE parallel environment for running multicore jobs in specified queue.
     """
     for name in subprocess.check_output(["qconf", "-spl"]).strip().split():
         if name:
             for line in subprocess.check_output(["qconf", "-sp", name]).split("\n"):
                 if _has_parallel_environment(line):
-                    return name
+                    if _queue_can_access_pe(name, queue):
+                        return name
     raise ValueError("Could not find an SGE environment configured for parallel execution. " \
                      "See %s for SGE setup instructions." %
                      "https://blogs.oracle.com/templedf/entry/configuring_a_new_parallel_environment")
+
+def _parseSGEConf(data):
+    """Handle SGE multiple line output nastiness.
+    From: https://github.com/clovr/vappio/blob/master/vappio-twisted/vappio_tx/load/sge_queue.py
+    """
+    lines = data.split('\n')
+    multiline = False
+    ret = {}
+    for line in lines:
+        line = line.strip()
+        if line:
+            if not multiline:
+                key, value = line.split(' ', 1)
+                value = value.strip().rstrip('\\')
+                ret[key] = value
+            else:
+                # Making use of the fact that the key was created
+                # in the previous iteration and is stil lin scope
+                ret[key] += line
+            multiline = (line[-1] == '\\')
+    return ret
+
+def _queue_can_access_pe(pe_name, queue):
+    """Check if a queue has access to a specific parallel environment, using qconf.
+    """
+    if not queue.endswith(".q"):
+        queue = "%s.q" % queue
+    queue_config = _parseSGEConf(subprocess.check_output(["qconf", "-sq", queue]))
+    for test_pe_name in queue_config["pe_list"].split():
+        test_pe_name = test_pe_name.split(",")[0].strip()
+        if test_pe_name == pe_name:
+            return True
+    return False
 
 def _has_parallel_environment(line):
     if line.startswith("allocation_rule"):
@@ -206,6 +240,7 @@ class BcbioSLURMEngineSetLauncher(SLURMLauncher, launcher.BatchClusterAppMixin):
     mem = traitlets.Unicode("", config=True)
     account = traitlets.Unicode("", config=True)
     timelimit = traitlets.Unicode("", config=True)
+    resources = traitlets.Unicode("", config=True)
     default_template = traitlets.Unicode("""#!/bin/sh
 #SBATCH -p {queue}
 #SBATCH -J bcbio-ipengine[1-{n}]
@@ -217,6 +252,7 @@ class BcbioSLURMEngineSetLauncher(SLURMLauncher, launcher.BatchClusterAppMixin):
 #SBATCH -t {timelimit}
 #SBATCH -N {machines}
 {mem}
+{resources}
 %s %s --profile-dir="{profile_dir}" --cluster-id="{cluster_id}"
     """ % (' '.join(map(pipes.quote, launcher.ipengine_cmd_argv)),
            ' '.join(timeout_params)))
@@ -232,6 +268,9 @@ class BcbioSLURMEngineSetLauncher(SLURMLauncher, launcher.BatchClusterAppMixin):
         self.context["machines"] = self.machines
         self.context["account"] = self.account
         self.context["timelimit"] = self.timelimit
+        self.context["resources"] = "\n".join(["#SBATCH --%s" % r.strip()
+                                               for r in str(self.resources).split(";")
+                                               if r.strip()])
         return super(BcbioSLURMEngineSetLauncher, self).start(n)
 
 class BcbioSLURMControllerLauncher(SLURMLauncher, launcher.BatchClusterAppMixin):
@@ -239,6 +278,7 @@ class BcbioSLURMControllerLauncher(SLURMLauncher, launcher.BatchClusterAppMixin)
     account = traitlets.Unicode("", config=True)
     timelimit = traitlets.Unicode("", config=True)
     mem = traitlets.Unicode("", config=True)
+    resources = traitlets.Unicode("", config=True)
     default_template = traitlets.Unicode("""#!/bin/sh
 #SBATCH -J bcbio-ipcontroller
 #SBATCH -o bcbio-ipcontroller.out.%%j
@@ -246,18 +286,17 @@ class BcbioSLURMControllerLauncher(SLURMLauncher, launcher.BatchClusterAppMixin)
 #SBATCH -A {account}
 #SBATCH -t {timelimit}
 {mem}
+{resources}
 %s --ip=* --log-to-file --profile-dir="{profile_dir}" --cluster-id="{cluster_id}" %s
     """%(' '.join(map(pipes.quote, launcher.ipcontroller_cmd_argv)),
          ' '.join(controller_params)))
     def start(self):
         self.context["account"] = self.account
         self.context["timelimit"] = self.timelimit
-        if self.mem:
-            # scale memory to Mb and divide by cores
-            mem = int(math.ceil(float(self.mem) * 1024.0))
-            self.context["mem"] = "#SBATCH --mem-per-cpu=%s" % mem
-        else:
-            self.context["mem"] = "#SBATCH --mem-per-cpu=%d" % DEFAULT_MEM_PER_CPU
+        self.context["mem"] = "#SBATCH --mem-per-cpu=%d" % (DEFAULT_MEM_PER_CPU * 4)
+        self.context["resources"] = "\n".join(["#SBATCH --%s" % r.strip()
+                                               for r in str(self.resources).split(";")
+                                               if r.strip()])
         return super(BcbioSLURMControllerLauncher, self).start(1)
 
 
@@ -461,7 +500,7 @@ def _get_profile_args(profile):
     else:
         return ["--profile=%s" % profile]
 
-def _scheduler_resources(scheduler, params):
+def _scheduler_resources(scheduler, params, queue):
     """Retrieve custom resource tweaks for specific schedulers.
     Handles SGE parallel environments, which allow multicore jobs
     but are specific to different environments.
@@ -480,7 +519,7 @@ def _scheduler_resources(scheduler, params):
             else:
                 pass_resources.append(r)
         if pename is None:
-            pename = _find_parallel_environment()
+            pename = _find_parallel_environment(queue)
         resources = pass_resources
 
     return ";".join(resources), pename
@@ -502,7 +541,11 @@ def _start(scheduler, profile, queue, num_jobs, cores_per_job, cluster_id,
                "your scheduler. If it should, please file a bug report at "
                "http://github.com/roryk/ipython-cluster-helper. Thanks!")
         sys.exit(1)
-    resources, pename = _scheduler_resources(scheduler, extra_params)
+    resources, pename = _scheduler_resources(scheduler, extra_params, queue)
+    if scheduler in ["OLDSLURM", "SLURM"]:
+        resources, slurm_atrs = get_slurm_attributes(queue, resources)
+    else:
+        slurm_atrs = None
 
     args = launcher.ipcluster_cmd_argv + \
         ["start",
@@ -513,6 +556,7 @@ def _start(scheduler, profile, queue, num_jobs, cores_per_job, cluster_id,
          "--debug",
          "--n=%s" % num_jobs,
          "--%s.cores=%s" % (engine_class, cores_per_job),
+         "--%s.resources='%s'" % (controller_class, resources),
          "--%s.resources='%s'" % (engine_class, resources),
          "--%s.mem='%s'" % (engine_class, extra_params.get("mem", "")),
          "--%s.mem='%s'" % (controller_class, extra_params.get("mem", "")),
@@ -524,15 +568,12 @@ def _start(scheduler, profile, queue, num_jobs, cores_per_job, cluster_id,
     args += _get_profile_args(profile)
     if pename:
         args += ["--%s.pename=%s" % (engine_class, pename)]
-    elif scheduler in ["OLDSLURM", "SLURM"]:
-        # SLURM cannot get resource atts (native specification) as SGE does
-        slurm_atrs = get_slurm_attributes(queue, resources)
+    if slurm_atrs:
         args += ["--%s.machines=%s" % (engine_class, slurm_atrs.get("machines", "1"))]
         args += ["--%s.account=%s" % (engine_class, slurm_atrs["account"])]
         args += ["--%s.account=%s" % (controller_class, slurm_atrs["account"])]
-        args += ["--%s.timelimit=%s" % (engine_class, slurm_atrs["timelimit"])]
-        args += ["--%s.timelimit=%s" % (controller_class, slurm_atrs["timelimit"])]
-
+        args += ["--%s.timelimit='%s'" % (engine_class, slurm_atrs["timelimit"])]
+        args += ["--%s.timelimit='%s'" % (controller_class, slurm_atrs["timelimit"])]
     subprocess.check_call(args)
     return cluster_id
 
@@ -580,6 +621,11 @@ def cluster_view(scheduler, queue, num_jobs, cores_per_job=1, profile=None,
         has_throwaway = True
         profile = create_throwaway_profile()
     else:
+        # ensure we have an .ipython directory to prevent issues
+        # creating it during parallel startup
+        cmd = [sys.executable, "-c", "from IPython import start_ipython; start_ipython()",
+               "profile", "create"]
+        subprocess.check_call(cmd)
         has_throwaway = False
     num_tries = 0
 
@@ -632,8 +678,9 @@ def _slurm_version():
 
 def create_throwaway_profile():
     profile = str(uuid.uuid1())
-    cmd = "ipython profile create {0} --parallel".format(profile)
-    subprocess.check_call(cmd, shell=True)
+    cmd = [sys.executable, "-c", "from IPython import start_ipython; start_ipython()",
+           "profile", "create", profile, "--parallel"]
+    subprocess.check_call(cmd)
     return profile
 
 def get_url_file(profile, cluster_id):

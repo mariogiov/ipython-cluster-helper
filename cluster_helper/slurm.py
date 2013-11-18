@@ -38,20 +38,18 @@ def get_account_for_queue(queue):
     the queue and returns the first one
     """
     user = get_user()
-
     possible_accounts = get_accounts(user)
-
     queue_accounts = accounts_with_access(queue)
     try:
         assert not set(['']).issuperset(queue_accounts)
     except AssertionError:
         raise ValueError("No accounts accessible by user \'{0}\' have access to queue \'{1}\'. Accounts found were: {2}".format(
                          user, queue, ", ".join(possible_accounts)))
-
-    if "all" in queue_accounts:
-        return possible_accounts.pop()
+    accts = list(possible_accounts.intersection(queue_accounts))
+    if "all" not in queue_accounts and len(accts) > 0:
+        return accts[0]
     else:
-        return list(possible_accounts.intersection(queue_accounts))[0]
+        return possible_accounts.pop()
 
 def get_max_timelimit_for_queue(queue):
     cmd = 'sinfo -o "%l" --noheader -p {0}'.format(queue)
@@ -61,13 +59,23 @@ def get_max_timelimit_for_queue(queue):
 
 def get_slurm_attributes(queue, resources):
     slurm_atrs = {}
+    # specially handled resource specifications
+    special_resources = set(["machines", "account", "timelimit"])
+    default_tl = "7-00:00:00" # 1 week default
     if resources:
         for parm in resources.split(";"):
-            atr = [ a.strip() for a in  parm.split('=') ]
-            slurm_atrs[atr[0]] = atr[1]
+            k, v = [ a.strip() for a in  parm.split('=') ]
+            slurm_atrs[k] = v
     if "account" not in slurm_atrs:
         slurm_atrs["account"] = get_account_for_queue(queue)
     if "timelimit" not in slurm_atrs:
-        slurm_atrs["timelimit"] = get_max_timelimit_for_queue(queue)
-
-    return slurm_atrs
+        tl = get_max_timelimit_for_queue(queue)
+        if tl == "infinite":
+            tl = default_tl
+        slurm_atrs["timelimit"] = tl
+    # reconstitute any general attributes to pass along to slurm
+    out_resources = []
+    for k in slurm_atrs:
+        if k not in special_resources:
+            out_resources.append("%s=%s" % (k, slurm_atrs[k]))
+    return ";".join(out_resources), slurm_atrs
